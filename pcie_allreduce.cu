@@ -1,7 +1,5 @@
 // PCIe-only custom allreduce extension.
-// DMA-gather variant: uses Copy Engine to gather peer data to local scratch,
-// then reduces from local HBM only. Avoids SM-initiated PCIe reads which
-// are slow on CPU root complex (no PCIe switch) topologies.
+// System-scope barriers for cross-GPU visibility over PCIe switch fabric.
 // Self-contained: no sgl-kernel headers needed.
 
 #include <ATen/cuda/Exceptions.h>
@@ -37,7 +35,6 @@ namespace pcie_allreduce {
 // ---- Data structures ----
 
 constexpr int kMaxBlocks = 36;
-constexpr int kMaxGpus = 8;
 using FlagType = uint32_t;
 
 // 128B stride per rank to avoid PCIe false sharing (one GPU L2 cache line).
@@ -162,42 +159,16 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-// ---- Barrier-only kernel (1 block) ----
-// Launched between input memcpy and DMA gather to ensure all peers
-// have finished writing their input data.
-template <int ngpus>
-__global__ void barrier_kernel(RankSignals sg, Signal* self_sg, int rank) {
-  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
-}
+// ---- PCIe kernel ----
 
-// ---- Local reduce kernel ----
-// Reads only from local GPU memory: own input buffer + DMA-gathered scratch copies.
-// scratch_ptrs contains (ngpus-1) pointers to local scratch buffers holding peer data.
-template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1) local_reduce_kernel(
-    const void* __restrict__ self_input,
-    const void* const* __restrict__ scratch_ptrs,
-    T* __restrict__ result,
-    int size) {
-  using P = typename packed_t<T>::P;
-  using A = typename packed_t<T>::A;
-  constexpr int n_peers = ngpus - 1;
-
-  // Build local pointer array: self first, then scratch copies
-  const P* local_ptrs[ngpus];
-  local_ptrs[0] = (const P*)self_input;
-#pragma unroll
-  for (int i = 0; i < n_peers; i++) {
-    local_ptrs[i + 1] = (const P*)scratch_ptrs[i];
-  }
-
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
-    ((P*)result)[idx] = packed_reduce<P, ngpus, A>(local_ptrs, idx);
-  }
-}
-
-// ---- Legacy PCIe kernel (kept for CUDA graph capture path) ----
-
+// 1-stage allreduce with staggered peer reads and start-barrier-only.
+// Staggering spreads PCIe traffic across the switch fabric by having each
+// GPU read peers in a different rotated order.
+// The end barrier is unnecessary because the caller double-buffers: two IPC
+// buffer sets alternate, so the start barrier of the NEXT allreduce guarantees
+// all peers finished reading the current slot before it gets overwritten.
+// During CUDA graph capture each allreduce gets its own unique buffer, so
+// there is no reuse conflict and no end barrier is needed either.
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -239,14 +210,6 @@ class PCIeAllreduce {
   int dbuf_slot_ = 0;
   void* dbuf_raw_[2][8] = {};
   RankData* dbuf_rd_[2] = {};
-
-  // DMA-gather scratch buffers (local GPU memory for peer data copies).
-  // Double-buffered to match the IPC double-buffering.
-  void* scratch_[2][kMaxGpus - 1] = {};
-  const void** d_scratch_ptrs_[2] = {};  // Device-side pointer arrays
-  RankData host_rd_[2];                  // Host-side copy of peer IPC pointers
-  int ar_slot_ = 0;                      // Alternating slot for scratch buffers
-  size_t scratch_buf_size_ = 0;          // Size of each scratch buffer
 
   PCIeAllreduce(
       Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
@@ -299,8 +262,6 @@ class PCIeAllreduce {
         data.ptrs[i] = ptrs[i];
         dbuf_raw_[s][i] = ptrs[i];
       }
-      // Save host-side copy of peer IPC pointers for DMA gather
-      host_rd_[s] = data;
       dbuf_rd_[s] = d_rank_data_base_++;
       CHECK_CUDA_SUCCESS(cudaMemcpy(dbuf_rd_[s], &data, sizeof(RankData), cudaMemcpyHostToDevice));
     }
@@ -308,37 +269,6 @@ class PCIeAllreduce {
     buffers_[ptrs1[rank_]] = dbuf_rd_[1];
     dbuf_enabled_ = true;
     dbuf_slot_ = 0;
-  }
-
-  void allocate_scratch(size_t max_size) {
-    if (scratch_buf_size_ >= max_size) return;  // Already large enough
-    scratch_buf_size_ = max_size;
-
-    int n_peers = world_size_ - 1;
-    for (int s = 0; s < 2; s++) {
-      // Free old scratch buffers if any
-      for (int p = 0; p < n_peers; p++) {
-        if (scratch_[s][p]) {
-          cudaFree(scratch_[s][p]);
-          scratch_[s][p] = nullptr;
-        }
-      }
-      if (d_scratch_ptrs_[s]) {
-        cudaFree((void*)d_scratch_ptrs_[s]);
-        d_scratch_ptrs_[s] = nullptr;
-      }
-
-      // Allocate new scratch buffers
-      for (int p = 0; p < n_peers; p++) {
-        CHECK_CUDA_SUCCESS(cudaMalloc(&scratch_[s][p], max_size));
-      }
-
-      // Allocate and populate device-side pointer array
-      const void** d_ptrs;
-      CHECK_CUDA_SUCCESS(cudaMalloc(&d_ptrs, n_peers * sizeof(void*)));
-      CHECK_CUDA_SUCCESS(cudaMemcpy(d_ptrs, scratch_[s], n_peers * sizeof(void*), cudaMemcpyHostToDevice));
-      d_scratch_ptrs_[s] = d_ptrs;
-    }
   }
 
   void register_buffer(void** ptrs) {
@@ -374,51 +304,6 @@ class PCIeAllreduce {
     graph_unreg_buffers_.clear();
   }
 
-  template <int ngpus>
-  void launch_barrier(cudaStream_t stream) {
-    barrier_kernel<ngpus><<<1, ngpus, 0, stream>>>(sg_, self_sg_, rank_);
-  }
-
-  template <typename T, int ngpus>
-  void dma_gather_allreduce(cudaStream_t stream, T* input, T* output, int size, int threads, int block_limit) {
-    auto d = packed_t<T>::P::size;
-    int packed_size = size / d;
-    int blocks = std::min(block_limit, (packed_size + threads - 1) / threads);
-    blocks = std::max(blocks, 1);
-    auto input_size_bytes = size * sizeof(T);
-
-    int slot = ar_slot_ % 2;
-    ar_slot_++;
-
-    // Step 1: Copy input to IPC double-buffer (peers can read it after barrier)
-    int dbuf_slot = dbuf_slot_ - 1;  // dbuf_slot_ was already incremented by caller
-    int dbuf_s = dbuf_slot % 2;
-
-    // Step 2: Barrier — wait for all peers to finish writing their input
-    switch (world_size_) {
-      case 2: launch_barrier<2>(stream); break;
-      case 4: launch_barrier<4>(stream); break;
-      case 6: launch_barrier<6>(stream); break;
-      case 8: launch_barrier<8>(stream); break;
-    }
-
-    // Step 3: DMA-gather peer data to local scratch buffers
-    int peer_idx = 0;
-    for (int i = 0; i < world_size_; i++) {
-      if (i == rank_) continue;
-      const void* peer_src = host_rd_[dbuf_s].ptrs[i];
-      CHECK_CUDA_SUCCESS(cudaMemcpyAsync(
-          scratch_[slot][peer_idx], peer_src, input_size_bytes, cudaMemcpyDeviceToDevice, stream));
-      peer_idx++;
-    }
-
-    // Step 4: Local reduce kernel — reads only from local HBM
-    // self_input is our own IPC buffer (already contains our data)
-    const void* self_input = host_rd_[dbuf_s].ptrs[rank_];
-    local_reduce_kernel<T, ngpus><<<blocks, threads, 0, stream>>>(
-        self_input, d_scratch_ptrs_[slot], output, packed_size);
-  }
-
   template <typename T>
   void allreduce(cudaStream_t stream, T* input, T* output, int size, int threads = 512, int block_limit = 36) {
     auto d = packed_t<T>::P::size;
@@ -436,25 +321,8 @@ class PCIeAllreduce {
       dbuf_slot_++;
       auto input_size = size * sizeof(T);
       AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, input_size, cudaMemcpyDeviceToDevice, stream));
-
-      // Use DMA-gather path: allocate scratch if needed, then gather+reduce
-      allocate_scratch(input_size);
-
-#define DMA_KL(ngpus) dma_gather_allreduce<T, ngpus>(stream, input, output, size, threads, block_limit);
-      switch (world_size_) {
-        case 2: DMA_KL(2); break;
-        case 4: DMA_KL(4); break;
-        case 6: DMA_KL(6); break;
-        case 8: DMA_KL(8); break;
-        default:
-          throw std::runtime_error("only supports (2,4,6,8) gpus, got " + std::to_string(world_size_));
-      }
-#undef DMA_KL
-      return;
-    }
-
-    // Graph capture path or non-dbuf path: use legacy SM-read kernel
-    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = dbuf_rd_[slot];
+    } else if (status == cudaStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
     } else {
@@ -483,14 +351,6 @@ class PCIeAllreduce {
 
   ~PCIeAllreduce() {
     for (auto [_, ptr] : ipc_handles_) CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
-    // Free scratch buffers
-    int n_peers = world_size_ - 1;
-    for (int s = 0; s < 2; s++) {
-      for (int p = 0; p < n_peers; p++) {
-        if (scratch_[s][p]) cudaFree(scratch_[s][p]);
-      }
-      if (d_scratch_ptrs_[s]) cudaFree((void*)d_scratch_ptrs_[s]);
-    }
   }
 };
 
