@@ -1,6 +1,6 @@
 """Find the PCIe custom allreduce vs NCCL crossover point.
 
-Sweeps message sizes from 1KB to 2MB, measures median latency for both
+Sweeps message sizes from 1KB to 512KB, measures median latency for both
 backends, and prints a comparison table. Run with:
 
     python bench_crossover.py [num_gpus]
@@ -14,11 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-_this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _this_dir)
-# Parent dir so spawned workers can `import pcie_allreduce`.
-sys.path.insert(0, os.path.dirname(_this_dir))
-from cuda_ipc import CudaIPC
+_repo_root = os.path.dirname(os.path.abspath(__file__))
 
 WARMUP = 100
 ITERS = 500
@@ -32,8 +28,8 @@ def worker(rank, world_size):
     os.environ["MASTER_PORT"] = "29520"
     torch.cuda.set_device(rank)
 
-    sys.path.insert(0, _this_dir)
-    sys.path.insert(0, os.path.dirname(_this_dir))
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
 
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
@@ -50,6 +46,7 @@ def worker(rank, world_size):
     gloo_group = dist.new_group(backend="gloo")
 
     import pcie_allreduce
+    from pcie_allreduce.cuda_ipc import CudaIPC
 
     # ---- Setup custom AR (needs large enough buffers for the sweep) ----
     max_buf = 512 * 1024  # 512KB — upper bound of sweep
@@ -101,7 +98,7 @@ def worker(rank, world_size):
     # ---- Size sweep: expressed as (numel, dtype) pairs ----
     # We sweep bf16 since that's the decode allreduce dtype.
     sizes_bytes = []
-    # Powers of 2 from 1KB to 2MB.
+    # Powers of 2 from 1KB to 512KB.
     b = 1024
     while b <= 512 * 1024:
         sizes_bytes.append(b)

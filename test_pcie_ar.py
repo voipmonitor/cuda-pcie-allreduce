@@ -7,8 +7,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cuda_ipc import CudaIPC
+from pcie_allreduce.cuda_ipc import CudaIPC
+
+# Repo root so spawned subprocesses can find the pcie_allreduce package.
+_repo_root = os.path.dirname(os.path.abspath(__file__))
 
 
 def worker(rank, world_size):
@@ -17,18 +19,16 @@ def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29501"
 
-    # Ensure the parent directory is on sys.path so `import pcie_allreduce`
-    # resolves to this package in spawned subprocesses.
-    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _parent not in sys.path:
-        sys.path.insert(0, _parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
 
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     import pcie_allreduce
+    from pcie_allreduce.cuda_ipc import CudaIPC as _CudaIPC
 
-    ipc = CudaIPC()
+    ipc = _CudaIPC()
     max_size = 56 * 1024
     meta_sz = pcie_allreduce.meta_size()
 

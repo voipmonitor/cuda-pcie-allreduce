@@ -8,8 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cuda_ipc import CudaIPC
+_repo_root = os.path.dirname(os.path.abspath(__file__))
 
 
 def worker(rank, world_size):
@@ -18,14 +17,14 @@ def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29510"
 
-    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _parent not in sys.path:
-        sys.path.insert(0, _parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
 
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     import pcie_allreduce
+    from pcie_allreduce.cuda_ipc import CudaIPC
 
     ipc = CudaIPC()
     max_size = 56 * 1024
