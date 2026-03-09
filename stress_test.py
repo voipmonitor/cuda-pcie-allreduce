@@ -8,7 +8,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-_repo_root = os.path.dirname(os.path.abspath(__file__))
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_this_dir)
 
 
 def worker(rank, world_size):
@@ -17,14 +18,21 @@ def worker(rank, world_size):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29510"
 
-    if _repo_root not in sys.path:
-        sys.path.insert(0, _repo_root)
+    if _parent_dir not in sys.path:
+        sys.path.insert(0, _parent_dir)
+    if _this_dir not in sys.path:
+        sys.path.insert(0, _this_dir)
 
     torch.cuda.set_device(rank)
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-    import pcie_allreduce
-    from pcie_allreduce.cuda_ipc import CudaIPC
+    try:
+        import pcie_allreduce
+    except ModuleNotFoundError:
+        # Running from repo root (pcie_allreduce/ is a subdir)
+        sys.path.insert(0, os.path.dirname(_parent_dir))
+        import pcie_allreduce
+    from cuda_ipc import CudaIPC
 
     ipc = CudaIPC()
     max_size = 56 * 1024
@@ -66,7 +74,7 @@ def worker(rank, world_size):
 
     rank_data = torch.empty(max_size, dtype=torch.uint8, device=f"cuda:{rank}")
     fa = pcie_allreduce.init_custom_ar(meta_ptrs, rank_data, rank)
-    pcie_allreduce.register_pcie_buffers(fa, buf_ptrs_0, buf_ptrs_1)
+    pcie_allreduce.register_pcie_buffers(fa, buf_ptrs_0, buf_ptrs_1, max_size)
     torch.cuda.synchronize()
 
     dev = f"cuda:{rank}"

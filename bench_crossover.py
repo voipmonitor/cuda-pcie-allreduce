@@ -89,7 +89,7 @@ def worker(rank, world_size):
 
     rank_data = torch.empty(max_buf, dtype=torch.uint8, device=f"cuda:{rank}")
     fa = pcie_allreduce.init_custom_ar(meta_ptrs, rank_data, rank)
-    pcie_allreduce.register_pcie_buffers(fa, buf0, buf1)
+    pcie_allreduce.register_pcie_buffers(fa, buf0, buf1, max_buf)
     torch.cuda.synchronize()
     dist.barrier()
 

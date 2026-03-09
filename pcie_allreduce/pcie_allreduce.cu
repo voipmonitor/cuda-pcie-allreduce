@@ -1,5 +1,14 @@
 // PCIe-only custom allreduce extension.
-// System-scope barriers for cross-GPU visibility over PCIe switch fabric.
+// Optimized for CPU root complex topologies (no PCIe switch, no NVLink).
+//
+// Two fused kernel modes (eager double-buffer path):
+//   1. Push+reduce: SM writes to all peers' IPC buffers (posted PCIe TLPs),
+//      then reduces from own buffer (local HBM reads). Fastest when IPC
+//      buffer is large enough for partitioned layout (msg_size * world_size).
+//   2. Fused pull+reduce: SM copies input to own IPC buffer, barrier, then
+//      reads peers. Saves one host API call vs legacy 2-step path.
+//
+// Legacy kernel retained for CUDA graph capture and register_buffer path.
 // Self-contained: no sgl-kernel headers needed.
 
 #include <ATen/cuda/Exceptions.h>
@@ -159,16 +168,96 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-// ---- PCIe kernel ----
+// ---- Fused push+reduce kernel (optimal for PCIe) ----
+//
+// Each GPU WRITES its data to every peer's IPC buffer (posted PCIe TLPs,
+// fire-and-forget) and then reduces from its OWN buffer (local HBM reads).
+//
+// The IPC buffer is partitioned: slot k holds rank k's data at offset
+// k * packed_size. After barrier, each GPU reads slots 0..ngpus-1 from
+// its own buffer — all local reads.
+//
+// Single block: for decode-sized messages (14KB), one block of 512 threads
+// gives ~2 packed elements per thread which is plenty.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) fused_push_reduce_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ result,
+    int rank, int packed_size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
 
-// 1-stage allreduce with staggered peer reads and start-barrier-only.
-// Staggering spreads PCIe traffic across the switch fabric by having each
-// GPU read peers in a different rotated order.
-// The end barrier is unnecessary because the caller double-buffers: two IPC
-// buffer sets alternate, so the start barrier of the NEXT allreduce guarantees
-// all peers finished reading the current slot before it gets overwritten.
-// During CUDA graph capture each allreduce gets its own unique buffer, so
-// there is no reuse conflict and no end barrier is needed either.
+  // Phase 1: Push — write our input to slot[rank] of EVERY GPU's buffer.
+  // Writes to peers go via BAR1 as posted PCIe TLPs (fire-and-forget).
+  // Write to own buffer is a local HBM store.
+  for (int idx = threadIdx.x; idx < packed_size; idx += blockDim.x) {
+    P val = ((const P*)input)[idx];
+#pragma unroll
+    for (int g = 0; g < ngpus; g++) {
+      ((P*)dp.ptrs[g])[rank * packed_size + idx] = val;
+    }
+  }
+
+  // Ensure all threads finished pushing before entering barrier.
+  __syncthreads();
+
+  // Phase 2: Barrier — __threadfence_system() flushes all posted writes
+  // system-wide, then flag exchange confirms all peers are done.
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
+  // Phase 3: Local reduce — read all slots from OUR buffer.
+  // All reads are local HBM (~3 TB/s), zero PCIe traffic.
+  const P* my_buf = (const P*)dp.ptrs[rank];
+  for (int idx = threadIdx.x; idx < packed_size; idx += blockDim.x) {
+    A acc = upcast(my_buf[0 * packed_size + idx]);
+#pragma unroll
+    for (int k = 1; k < ngpus; k++) {
+      packed_assign_add(acc, upcast(my_buf[k * packed_size + idx]));
+    }
+    ((P*)result)[idx] = downcast<P>(acc);
+  }
+}
+
+// ---- Fused pull+reduce kernel ----
+//
+// Single kernel that copies input to IPC buffer (replacing cudaMemcpyAsync),
+// does barrier, then reads peers and reduces. Saves one host API call (~5μs).
+// Used when push mode can't fit (msg too large for partitioned buffer).
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) fused_pull_reduce_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ result,
+    int rank, int packed_size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+
+  // Phase 1: Copy input to our IPC buffer (local D2D, replaces cudaMemcpyAsync).
+  P* my_buf = (P*)dp.ptrs[rank];
+  for (int idx = threadIdx.x; idx < packed_size; idx += blockDim.x) {
+    my_buf[idx] = ((const P*)input)[idx];
+  }
+
+  // Ensure copy complete before barrier.
+  __syncthreads();
+
+  // Phase 2: Barrier.
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
+  // Phase 3: Reduce — read from all peers (staggered to spread PCIe traffic).
+  const P* rotated[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus];
+  }
+  for (int idx = threadIdx.x; idx < packed_size; idx += blockDim.x) {
+    ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
+  }
+}
+
+// ---- Legacy PCIe kernel (multi-block, for graph capture and fallback) ----
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
     RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
@@ -210,6 +299,9 @@ class PCIeAllreduce {
   int dbuf_slot_ = 0;
   void* dbuf_raw_[2][8] = {};
   RankData* dbuf_rd_[2] = {};
+
+  // Buffer capacity for push mode partitioning.
+  size_t dbuf_capacity_ = 0;
 
   PCIeAllreduce(
       Signal** signals, void* rank_data, size_t rank_data_sz, int rank, int world_size)
@@ -253,7 +345,7 @@ class PCIeAllreduce {
       throw std::runtime_error("Rank data buffer overflow");
   }
 
-  void register_pcie_buffers(void** ptrs0, void** ptrs1) {
+  void register_pcie_buffers(void** ptrs0, void** ptrs1, size_t buf_capacity = 0) {
     check_rank_data_capacity(2);
     for (int s = 0; s < 2; s++) {
       void** ptrs = s == 0 ? ptrs0 : ptrs1;
@@ -269,6 +361,7 @@ class PCIeAllreduce {
     buffers_[ptrs1[rank_]] = dbuf_rd_[1];
     dbuf_enabled_ = true;
     dbuf_slot_ = 0;
+    dbuf_capacity_ = buf_capacity;
   }
 
   void register_buffer(void** ptrs) {
@@ -319,10 +412,44 @@ class PCIeAllreduce {
     if (dbuf_enabled_ && status != cudaStreamCaptureStatusActive) {
       int slot = dbuf_slot_ % 2;
       dbuf_slot_++;
-      auto input_size = size * sizeof(T);
-      AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, input_size, cudaMemcpyDeviceToDevice, stream));
+      auto input_size_bytes = (size_t)size * sizeof(T);
+      int packed_size = size / d;
       ptrs = dbuf_rd_[slot];
-    } else if (status == cudaStreamCaptureStatusActive) {
+
+      // Check if push model fits: need world_size slots of msg_size in buffer.
+      bool can_push = (dbuf_capacity_ > 0) &&
+                      (input_size_bytes * world_size_ <= dbuf_capacity_);
+
+      if (can_push) {
+        // Push+reduce: posted PCIe writes + local HBM reads. Fastest path.
+#define PUSH_KL(ngpus) fused_push_reduce_kernel<T, ngpus><<<1, threads, 0, stream>>>( \
+    ptrs, sg_, self_sg_, input, output, rank_, packed_size);
+        switch (world_size_) {
+          case 2: PUSH_KL(2); break;
+          case 4: PUSH_KL(4); break;
+          case 6: PUSH_KL(6); break;
+          case 8: PUSH_KL(8); break;
+          default: throw std::runtime_error("unsupported world size");
+        }
+#undef PUSH_KL
+      } else {
+        // Fused pull: SM copy + barrier + pull-reduce. Saves 1 host API call.
+#define PULL_KL(ngpus) fused_pull_reduce_kernel<T, ngpus><<<1, threads, 0, stream>>>( \
+    ptrs, sg_, self_sg_, input, output, rank_, packed_size);
+        switch (world_size_) {
+          case 2: PULL_KL(2); break;
+          case 4: PULL_KL(4); break;
+          case 6: PULL_KL(6); break;
+          case 8: PULL_KL(8); break;
+          default: throw std::runtime_error("unsupported world size");
+        }
+#undef PULL_KL
+      }
+      return;
+    }
+
+    // Graph capture path or non-dbuf path: use legacy kernel.
+    if (status == cudaStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
     } else {
@@ -436,7 +563,8 @@ static void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs
   fa->register_buffer(ipc_ptrs);
 }
 
-static void register_pcie_buffers(fptr_t _fa, const std::vector<fptr_t>& ptrs0, const std::vector<fptr_t>& ptrs1) {
+static void register_pcie_buffers(
+    fptr_t _fa, const std::vector<fptr_t>& ptrs0, const std::vector<fptr_t>& ptrs1, int64_t buf_capacity = 0) {
   auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
   TORCH_CHECK(ptrs0.size() == (size_t)fa->world_size_);
   TORCH_CHECK(ptrs1.size() == (size_t)fa->world_size_);
@@ -445,7 +573,7 @@ static void register_pcie_buffers(fptr_t _fa, const std::vector<fptr_t>& ptrs0, 
     p0[i] = reinterpret_cast<void*>(ptrs0[i]);
     p1[i] = reinterpret_cast<void*>(ptrs1[i]);
   }
-  fa->register_pcie_buffers(p0, p1);
+  fa->register_pcie_buffers(p0, p1, (size_t)buf_capacity);
 }
 
 static std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta(fptr_t _fa) {
@@ -471,7 +599,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dispose", &dispose, "dispose PCIe allreduce");
   m.def("meta_size", &meta_size, "signal metadata size");
   m.def("register_buffer", &register_buffer, "register IPC buffer");
-  m.def("register_pcie_buffers", &register_pcie_buffers, "register double-buffered IPC buffers");
+  m.def("register_pcie_buffers", &register_pcie_buffers, "register double-buffered IPC buffers",
+        pybind11::arg("fa"), pybind11::arg("ptrs0"), pybind11::arg("ptrs1"), pybind11::arg("buf_capacity") = 0);
   m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta, "get graph buffer IPC meta");
   m.def("register_graph_buffers", &register_graph_buffers, "register graph buffers");
 }
